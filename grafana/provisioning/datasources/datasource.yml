@@ -1,0 +1,25 @@
+# =============================================================================
+#  Grafana datasource provisioning — automatikusan bekonfigurált PostgreSQL
+#  A $POSTGRES_* értékeket a Grafana konténer env-jeiből interpolálja.
+# =============================================================================
+apiVersion: 1
+
+datasources:
+  - name: DataPlat PostgreSQL
+    uid: dataplat-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: $POSTGRES_USER
+    isDefault: true
+    editable: true
+    jsonData:
+      database: $POSTGRES_DB
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: $POSTGRES_PASSWORD

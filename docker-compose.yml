@@ -1,0 +1,173 @@
+# =============================================================================
+#  NordMart Data Platform  —  Integrált data engineering környezet
+# =============================================================================
+#  Egyetlen paranccsal indul:   docker compose up -d
+#
+#  Komponensek (5 szolgáltatás):
+#    postgres  – Analitikai adattárház (OLAP / star schema)        [gold]
+#    minio     – S3-kompatibilis objektumtároló / data lake        [bronze]
+#    etl       – Saját Python ELT motor (bronze -> silver -> gold)
+#    grafana   – Vizualizáció / dashboardok (auto-provisioned)
+#    adminer   – Könnyűsúlyú adatbázis-böngésző (DB UI)
+#
+#  Megjegyzés a verziókról:
+#    A hordozhatóság ("bárhol elindul") érdekében a külső image-ek a stabil
+#    "latest" taget használják. Produkciós környezetben javasolt rögzíteni,
+#    pl.:  minio/minio:RELEASE.2025-04-22T22-12-26Z  /  grafana/grafana:11.4.0
+# =============================================================================
+
+name: nordmart-dataplatform
+
+# -----------------------------------------------------------------------------
+#  Újrahasznosítható healthcheck / restart beállítás
+# -----------------------------------------------------------------------------
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  1) PostgreSQL  —  analitikai adattárház (gold layer, star schema)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: dp-postgres
+    <<: *default-restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Determinisztikus locale az index-/sort-stabilitásért
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - dataplat
+
+  # ---------------------------------------------------------------------------
+  #  2) MinIO  —  S3-kompatibilis objektumtároló (data lake / bronze layer)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: dp-minio
+    <<: *default-restart
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web konzol
+    volumes:
+      - miniodata:/data
+    networks:
+      - dataplat
+
+  # ---------------------------------------------------------------------------
+  #  3) ETL  —  saját Python ELT motor (a platform "szíve")
+  #     Folyamatosan: adatot generál -> bronze (MinIO) -> silver/gold (Postgres)
+  # ---------------------------------------------------------------------------
+  etl:
+    build:
+      context: ./etl
+      dockerfile: Dockerfile
+    image: nordmart/etl:local
+    container_name: dp-etl
+    <<: *default-restart
+    environment:
+      # --- Postgres kapcsolat ---
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # --- MinIO / S3 kapcsolat ---
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      # --- Pipeline paraméterek ---
+      ETL_INTERVAL_SECONDS: ${ETL_INTERVAL_SECONDS}
+      ETL_BATCH_SIZE: ${ETL_BATCH_SIZE}
+      ETL_N_CUSTOMERS: ${ETL_N_CUSTOMERS}
+    depends_on:
+      postgres:
+        condition: service_healthy   # csak egészséges DB után indul
+      minio:
+        condition: service_started
+    networks:
+      - dataplat
+
+  # ---------------------------------------------------------------------------
+  #  4) Grafana  —  vizualizáció (datasource + dashboard auto-provisioning)
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dp-grafana
+    <<: *default-restart
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # A datasource provisioning ezeket az env-eket interpolálja ($VAR formában)
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - dataplat
+
+  # ---------------------------------------------------------------------------
+  #  5) Adminer  —  könnyűsúlyú web-es DB böngésző (ellenőrzéshez)
+  # ---------------------------------------------------------------------------
+  adminer:
+    image: adminer:latest
+    container_name: dp-adminer
+    <<: *default-restart
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: dracula
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - dataplat
+
+# -----------------------------------------------------------------------------
+#  Perzisztens kötetek (adat túléli a konténer újraindítást)
+# -----------------------------------------------------------------------------
+volumes:
+  pgdata:
+    name: nordmart_pgdata
+  miniodata:
+    name: nordmart_miniodata
+  grafanadata:
+    name: nordmart_grafanadata
+
+# -----------------------------------------------------------------------------
+#  Közös, izolált bridge hálózat — a szolgáltatások nevükkel érik el egymást
+# -----------------------------------------------------------------------------
+networks:
+  dataplat:
+    name: nordmart_dataplat
+    driver: bridge
